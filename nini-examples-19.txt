@@ -1,0 +1,946 @@
+================================================================
+
+            NINI (Not INI) - FORMAT SPECIFICATION
+
+                      working draft
+
+2026 (c) Vladi Belperchinov-Shabanski "Cade" <cade@noxrun.com>
+
+            https://cade.noxrun.com/projects/NINI
+            https://github.com/cade-vs/NINI
+
+================================================================
+
+  NINI BY EXAMPLE - translating popular config formats to NINI
+
+                       see also:
+
+         DESIGN NOTES AND IMPLEMENTATION DETAILS
+                    (nini-spec.txt)
+
+================================================================
+Companion to nini-spec.txt. Shows how the config syntax of some
+well-known tools maps onto NINI. The "original" snippets are
+canonical but simplified; the point is the shape of the mapping,
+not feature-complete configs. Each section names the NINI feature
+it exercises.
+
+
+----------------------------------------------------------------
+1. INI   (the baseline NINI is "not")
+----------------------------------------------------------------
+
+Plain INI: flat "[section]" labels, "key = value", ';' or '#'
+comments, every value a bare string. NINI keeps the spirit and changes
+the spelling - no brackets, whitespace splits key from value, '#'
+comments - and adds nesting, which INI does not have. (The spec's
+section 1, NOT INI, makes the full contrast in prose.)
+
+original (app.ini):
+
+        ; service configuration
+        [server]
+        host  = 0.0.0.0
+        port  = 8080
+        debug = false
+
+        [logging]
+        level = info
+        file  = /var/log/app.log
+
+NINI:
+
+        # service configuration
+        =server
+            host 0.0.0.0
+            port 8080
+            debug false
+
+        =logging
+            level info
+            file /var/log/app.log
+
+
+----------------------------------------------------------------
+2. git config   (INI with quoted subsections)
+----------------------------------------------------------------
+
+git's [section "subsection"] is a two-level name; NINI writes it as
+sections with two path segments. Refspec values keep '*' ':' '+' '/'
+verbatim - no quoting needed (only a literal '#' would need quotes).
+
+original (.git/config):
+
+        [core]
+            editor = vim
+            autocrlf = false
+        [remote "origin"]
+            url = git@github.com:cade-vs/perl-decor.git
+            fetch = +refs/heads/*:refs/remotes/origin/*
+        [branch "main"]
+            remote = origin
+            merge = refs/heads/main
+
+NINI:
+
+        =core
+            editor vim
+            autocrlf false
+
+        =remote origin
+            url git@github.com:cade-vs/perl-decor.git
+            fetch +refs/heads/*:refs/remotes/origin/*
+
+        =branch main
+            remote origin
+            merge refs/heads/main
+
+
+----------------------------------------------------------------
+3. BIND named.conf   (C-style braces and ';')
+----------------------------------------------------------------
+exercises: nested sections, key[] lists, names with '.'
+
+A brace block becomes a section; a "{ a; b; c; }" value list becomes
+a key[] list. A block that carries both a parameter and a list (here
+listen-on) splits into a sub-section. "example.com" is a valid name
+('.' is ordinary after the first character).
+
+original (named.conf):
+
+        options {
+            directory "/var/named";
+            recursion yes;
+            allow-query { localhost; 10.0.0.0/8; };
+            listen-on port 53 { 127.0.0.1; 10.0.0.1; };
+        };
+        zone "example.com" {
+            type master;
+            file "example.com.zone";
+        };
+
+NINI:
+
+        =options
+          directory /var/named
+          recursion yes
+          allow-query[] localhost 10.0.0.0/8
+        =options listen-on
+          port 53
+          addrs[] 127.0.0.1 10.0.0.1
+        =zone example.com
+          type master
+          file example.com.zone
+
+
+----------------------------------------------------------------
+4. nginx   (blocks; repeated servers; path-keyed locations)
+----------------------------------------------------------------
+exercises: '*' auto-index for repeated blocks, the '/'-in-names limit
+
+Repeated "server" lines in an upstream are an ordered list - '*'
+auto-index. A location's path contains '/', which is NOT a legal NINI
+name character, so the path cannot be a segment; the idiomatic fix is
+an auto-index list of location records with the path held in a key.
+
+original (nginx.conf):
+
+        upstream backend {
+            server 10.0.0.1:8080 weight=5;
+            server 10.0.0.2:8080;
+        }
+        server {
+            listen 80;
+            server_name example.com;
+            location / {
+                proxy_pass http://backend;
+            }
+            location /static {
+                root /var/www;
+            }
+        }
+
+NINI:
+
+        =upstream backend *
+          server 10.0.0.1:8080
+          weight 5
+        =upstream backend *
+          server 10.0.0.2:8080
+        =server
+          listen 80
+          server_name example.com
+        =server location *
+          path /
+          proxy_pass http://backend
+        =server location *
+          path /static
+          root /var/www
+
+
+----------------------------------------------------------------
+5. Apache httpd   (virtual host; <Tag param> ... </Tag>)
+----------------------------------------------------------------
+exercises: nested tag blocks -> sections, tag parameter -> a key,
+'*' for repeated vhosts, path-in-tag -> path key, multi/repeat
+directives -> key[] lists
+
+Apache wraps blocks in paired, XML-ish tags - "<VirtualHost *:80>
+... </VirtualHost>" - and a tag can carry a parameter (the listen
+spec, a directory path). In NINI the close tags vanish; the open
+tag's parameter becomes a key. Several vhosts are an ordered list
+('*'). A <Directory /path> parameter is a '/'-bearing path, so it
+cannot be a segment name - it rides as a key in a path-keyed record,
+addressed under its specific vhost (here vhost 0).
+
+original (httpd vhost):
+
+        <VirtualHost *:80>
+            ServerName  example.com
+            ServerAlias www.example.com example.net
+            DocumentRoot /var/www/example
+
+            <Directory /var/www/example>
+                Options Indexes FollowSymLinks
+                AllowOverride All
+                Require all granted
+            </Directory>
+
+            ErrorLog /var/log/apache2/example_error.log
+        </VirtualHost>
+
+NINI:
+
+        =vhost *
+          listen *:80
+          ServerName example.com
+          ServerAlias[] www.example.com example.net
+          DocumentRoot /var/www/example
+          ErrorLog /var/log/apache2/example_error.log
+
+        =vhost 0 directory *
+          path /var/www/example
+          Options[] Indexes FollowSymLinks
+          AllowOverride All
+          Require all granted
+
+The "=vhost 0 directory *" addresses the directory record under the
+first vhost by its auto-index "0". If you would rather not address
+vhosts by number, key them explicitly instead - e.g. "=vhost web" and
+"=vhost web directory *" - keeping the same structure with readable
+names.
+
+
+----------------------------------------------------------------
+6. OpenSSH ssh_config   (shared defaults -> abstract + inherit)
+----------------------------------------------------------------
+exercises: '*' abstract sections, '&' inheritance, presence keys
+
+ssh's "Host *" block is defaults merged into every host. NINI makes
+the sharing EXPLICIT: keep the defaults in an abstract section (pruned
+from the result) and pull them with '&' where wanted. "Compression
+yes" becomes a presence-flag key. Note the semantic difference: ssh
+applies "Host *" by pattern-match at lookup time; NINI copies by value
+at parse time, so each host's inherited values are fixed and visible.
+
+original (~/.ssh/config):
+
+        Host *
+            ServerAliveInterval 60
+            Compression yes
+        Host web1
+            HostName 10.0.0.1
+            User deploy
+        Host web2
+            HostName 10.0.0.2
+            User deploy
+
+NINI:
+
+        *defaults
+          ServerAliveInterval 60
+          Compression
+        =host web1
+          & *defaults
+          HostName 10.0.0.1
+          User deploy
+        =host web2
+          & *defaults
+          HostName 10.0.0.2
+          User deploy
+
+emitted tree (the "*defaults" branch is pruned):
+
+        host.web1 = {ServerAliveInterval:"60", Compression:"1",
+                     HostName:"10.0.0.1", User:"deploy"}
+        host.web2 = {ServerAliveInterval:"60", Compression:"1",
+                     HostName:"10.0.0.2", User:"deploy"}
+
+
+----------------------------------------------------------------
+7. TOML array-of-tables   (a direct mapping)
+----------------------------------------------------------------
+exercises: '*' auto-index == array-of-tables
+
+TOML's [[name]] array-of-tables is exactly NINI's '*' auto-index: a
+named map whose entries are integer-keyed records. A plain [table] is
+just a section; a TOML array value is a key[] list.
+
+original (config.toml):
+
+        title = "demo"
+        ports = [80, 443]
+        [[server]]
+        ip = "10.0.0.1"
+        role = "web"
+        [[server]]
+        ip = "10.0.0.2"
+        role = "db"
+
+NINI:
+
+        title demo
+        ports[,] 80, 443
+        =server *
+          ip 10.0.0.1
+          role web
+        =server *
+          ip 10.0.0.2
+          role db
+
+
+----------------------------------------------------------------
+8. /etc/fstab   (whitespace table -> records)
+----------------------------------------------------------------
+exercises: '*' auto-index over a row-oriented format
+
+A columnar table is a list of records: one auto-index entry per row,
+columns become keys. Mount options are comma-delimited in fstab, so
+the list cites that separator with "opts[,]".
+
+original (/etc/fstab):
+
+        # dev        mount  fs    options          dump pass
+        /dev/sda1    /      ext4  defaults         0    1
+        /dev/sda2    /home  ext4  defaults,noatime 0    2
+
+NINI:
+
+        =mount *
+          dev     /dev/sda1
+          point   /
+          fs      ext4
+          opts[]  defaults
+          dump    0
+          pass    1
+        =mount *
+          dev     /dev/sda2
+          point   /home
+          fs      ext4
+          opts[;] defaults;noatime
+          dump    0
+          pass    2
+
+
+----------------------------------------------------------------
+9. Terraform HCL   (labeled blocks == path segments)
+----------------------------------------------------------------
+exercises: block labels -> path segments, nested blocks, key[] lists
+
+HCL's signature is the labeled block: "resource <type> <name> { }".
+Those labels are exactly NINI path segments - "=resource aws_instance
+web" - so HCL's two-label form is the most direct illustration of why
+NINI paths exist. The '=' assignment and quoted strings drop; a nested
+"tags = { }" block becomes a sub-section; a "[ ... ]" value is a list.
+
+original (main.tf):
+
+        resource "aws_instance" "web" {
+          ami             = "ami-12345"
+          instance_type   = "t3.micro"
+          security_groups = ["sg-1", "sg-2"]
+          tags = {
+            Name = "web-server"
+          }
+        }
+        resource "aws_instance" "db" {
+          ami           = "ami-67890"
+          instance_type = "t3.large"
+        }
+
+NINI:
+
+        =resource aws_instance web
+          ami ami-12345
+          instance_type t3.micro
+          security_groups[,] sg-1, sg-2
+        =resource aws_instance web tags
+          Name web-server
+        =resource aws_instance db
+          ami ami-67890
+          instance_type t3.large
+
+
+----------------------------------------------------------------
+10. YAML   (docker-compose; anchors/aliases == abstract + inherit)
+----------------------------------------------------------------
+exercises: nesting, key[] lists, '*' abstract + '&' inherit
+
+The headline parallel: YAML shares a node with '&anchor' to define and
+'*alias' to reference (here via the '<<:' merge key), and NINI shares
+with a '*'-abstract template and '&' inherit. Both languages reached
+for '&' and '*' for "share this" - with the roles swapped: YAML '&'
+defines / '*' refers; NINI '*' marks the template / '&' pulls it.
+Deep nesting becomes deeper paths; a "- item" sequence becomes key[].
+
+original (docker-compose.yml):
+
+        x-defaults: &defaults
+          restart: always
+          logging:
+            driver: json-file
+
+        services:
+          web:
+            <<: *defaults
+            image: nginx:1.25
+            ports:
+              - "80:80"
+              - "443:443"
+          db:
+            <<: *defaults
+            image: postgres:16
+
+NINI:
+
+        *defaults
+          restart always
+        *defaults logging
+          driver json-file
+        =services web
+          &&& *defaults
+          image nginx:1.25
+          ports[] 80:80 443:443
+        =services db
+          &&& *defaults
+          image postgres:16
+
+The "*defaults" branch is abstract, so it is pruned from the result;
+'&&& *defaults' copies its keys (restart) and subtree (logging) into
+each service, then the local image/ports are added.
+
+
+----------------------------------------------------------------
+11. .editorconfig   (glob section names - the worst NINI fit)
+----------------------------------------------------------------
+exercises: identifiers NINI cannot name -> moved into values
+
+editorconfig's whole identity is the glob section header: "[*]",
+"[*.{js,ts}]", "[lib/**.py]". Those patterns are made of exactly the
+characters NINI forbids in a name ('*', '/', '.', '{', '}'), so they
+cannot be section names at all. This is the format that fits NINI
+least naturally: each section flips into an auto-index record with the
+glob held in a value (globs are fine as VALUES - values are verbatim).
+Section precedence (later overrides matching earlier) survives as
+record order, applied read-side.
+
+original (.editorconfig):
+
+        root = true
+
+        [*]
+        indent_style = space
+        indent_size = 4
+
+        [*.{js,ts}]
+        indent_size = 2
+
+        [lib/**.py]
+        max_line_length = 100
+
+NINI:
+
+        root true
+        =section *
+          match *
+          indent_style space
+          indent_size 4
+        =section *
+          match *.{js,ts}
+          indent_size 2
+        =section *
+          match lib/**.py
+          max_line_length 100
+
+
+----------------------------------------------------------------
+12. XDG .desktop   (the '[locale]' / list-bracket clash)
+----------------------------------------------------------------
+
+exercises: the '[locale]' key suffix collides with the list bracket; a
+space in a group name becomes path segments
+
+Desktop entries group settings under "[Desktop Entry]" and localize
+keys with a bracket suffix, "Name[de]". Both fight NINI. A group name
+with a space cannot be one segment, so it nests as a path. And
+"Name[de]" would parse as a LIST key "Name" split on "de" - the
+bracket is always a list separator (11.) - so the locale must be
+spelled another way: a dotted key "Name.de" ('.' is ordinary) or a
+"=Desktop Entry Name" sub-section. The ';'-terminated Categories list
+cites '[;]'.
+
+original (dict.desktop):
+
+        [Desktop Entry]
+        Type=Application
+        Name=Dictionary
+        Name[de]=Wörterbuch
+        Exec=dict %U
+        Categories=Office;Dictionary;
+
+NINI:
+
+        =Desktop Entry
+          Type Application
+          Name Dictionary
+          Name.de Wörterbuch
+          Exec dict %U
+          Categories[;] Office; Dictionary
+
+
+----------------------------------------------------------------
+13. Java .properties   (dotted keys stay FLAT)
+----------------------------------------------------------------
+
+exercises: '.' is an ordinary name char, not a path separator
+
+A .properties file fakes hierarchy with dotted keys. NINI splits
+paths on whitespace, never on '.', and '.' is an ordinary name
+character - so "log.file.path" is a single flat key, not three levels.
+Keep it verbatim (faithful), or promote the dotted prefixes to real
+sections if structure is wanted.
+
+original (app.properties):
+
+        log.file.path = /var/log/app.log
+        log.level = INFO
+        db.host = localhost
+        db.port = 5432
+
+NINI:
+
+        log.file.path /var/log/app.log
+        log.level INFO
+        db.host localhost
+        db.port 5432
+
+        # or, promoted to real sections:
+        =log
+          level INFO
+        =log file
+          path /var/log/app.log
+        =db
+          host localhost
+          port 5432
+
+
+----------------------------------------------------------------
+14. Postfix main.cf   (no variable interpolation)
+----------------------------------------------------------------
+
+exercises: '$var' is stored verbatim; NINI never expands references
+
+Postfix expands "$mydomain" at load time. NINI does not interpolate
+anything - "$mydomain" is stored as the literal string, left for the
+consumer to resolve if it chooses. A comma list cites '[,]'; an
+explicit empty value is "". (Postfix's backslash line-continuation has
+no NINI equivalent: a long value stays on one line, or becomes a
+list.)
+
+original (main.cf):
+
+        myhostname = mail.example.com
+        mydomain = example.com
+        myorigin = $mydomain
+        mydestination = $myhostname, localhost.$mydomain, localhost
+        relayhost =
+
+NINI:
+
+        myhostname mail.example.com
+        mydomain example.com
+        myorigin $mydomain
+        mydestination[,] $myhostname, localhost.$mydomain, localhost
+        relayhost ""
+
+
+----------------------------------------------------------------
+15. /etc/network/interfaces   (stanzas; '=' returns to root)
+----------------------------------------------------------------
+
+exercises: stanza labels -> path segments; '=' pops the cursor to root
+
+Debian/Devuan interfaces uses stanzas: "iface eth0 inet static" then
+indented options. Those words are labels - a NINI path, like HCL (9.).
+"auto" and "allow-hotplug" list interface names. Because one option
+block is followed by another top-level stanza, the NINI needs a bare
+"=" to return to root between them: indentation in NINI is cosmetic
+(2.), so only the "=" actually pops the cursor.
+
+original (/etc/network/interfaces):
+
+        auto eth0 lo
+        iface eth0 inet static
+            address 192.168.1.10
+            gateway 192.168.1.1
+
+        allow-hotplug wlan0
+        iface wlan0 inet dhcp
+
+NINI:
+
+        auto[] eth0 lo
+        =iface eth0 inet static
+          address 192.168.1.10
+          gateway 192.168.1.1
+        =
+        allow-hotplug[] wlan0
+        =iface wlan0 inet dhcp
+
+
+----------------------------------------------------------------
+16. crontab   (irregular columns; literal '*')
+----------------------------------------------------------------
+
+exercises: a spaced command tail -> one quoted value; '*' is a literal value
+
+Unlike fstab's uniform columns (8.), a cron line ends in a free-form
+command full of spaces, so it must be quoted into a single value. Each
+line is an auto-index record. The schedule "*" and "*/15" are LITERAL
+values: in value position '*' is just a character, not the auto-index
+marker (5.), which only acts in a header or key token.
+
+original (crontab):
+
+        # m h dom mon dow command
+        30 2 * * 1 /usr/bin/backup --full /data
+        */15 * * * * /usr/bin/check-health
+
+NINI:
+
+        =job *
+          min  30
+          hour 2
+          dom  *
+          mon  *
+          dow  1
+          command "/usr/bin/backup --full /data"
+        =job *
+          min  */15
+          hour *
+          dom  *
+          mon  *
+          dow  *
+          command /usr/bin/check-health
+
+
+----------------------------------------------------------------
+17. XML   (elements, attributes, text all flatten)
+----------------------------------------------------------------
+
+exercises: child elements / attributes / text -> keys; repeated elements -> '*'
+
+XML carries three things NINI has one slot for: child elements,
+attributes, and text. The mapping flattens them - a text element
+"<host>10.0.0.1</host>" is a key:value, an attribute "protocol=..." is
+also a key, a nested element is a section, and repeated elements are
+an auto-index list. Close tags vanish, as with Apache (5.). The lossy
+case is an element with BOTH attributes and text: NINI must pick one
+(an extra key for the text, or drop the attributes).
+
+original (server.xml):
+
+        <server>
+          <host>10.0.0.1</host>
+          <listener protocol="http" port="80"/>
+          <listener protocol="https" port="443"/>
+        </server>
+
+NINI:
+
+        =server
+          host 10.0.0.1
+        =server listener *
+          protocol http
+          port 80
+        =server listener *
+          protocol https
+          port 443
+
+
+----------------------------------------------------------------
+18. Samba smb.conf   (spaces INSIDE key names)
+----------------------------------------------------------------
+
+exercises: space-bearing keys collide with tokenization -> keys joined
+
+smb.conf is INI, but its keys contain spaces - "read only", "valid
+users", "server string". NINI splits a key line at the first
+whitespace, so "read only no" would read key "read" / value "only no".
+The fix is to join the words ("read_only"); a space-separated value
+like "valid users" is a whitespace list.
+
+original (smb.conf):
+
+        [global]
+           workgroup = WORKGROUP
+           server string = Samba Server
+           security = user
+        [shared]
+           path = /srv/share
+           read only = no
+           valid users = alice bob
+
+NINI:
+
+        =global
+          workgroup WORKGROUP
+          server_string Samba Server
+          security user
+        =shared
+          path /srv/share
+          read_only no
+          valid_users[] alice bob
+
+
+----------------------------------------------------------------
+19. MySQL my.cnf   (bare directive flags)
+----------------------------------------------------------------
+
+exercises: valueless switches -> presence "1"
+
+my.cnf is INI with a twist: some directives are bare switches with no
+value ("skip-name-resolve"). That is exactly a NINI presence-flag key
+- a valueless key becomes "1" (3.).
+
+original (my.cnf):
+
+        [mysqld]
+        datadir = /var/lib/mysql
+        skip-name-resolve
+        max_connections = 200
+        log-error = /var/log/mysqld.log
+
+NINI:
+
+        =mysqld
+          datadir /var/lib/mysql
+          skip-name-resolve
+          max_connections 200
+          log-error /var/log/mysqld.log
+
+
+----------------------------------------------------------------
+20. Caddyfile   (site block; literal '*' matcher)
+----------------------------------------------------------------
+
+exercises: site address -> section; bare directive -> flag; args -> list
+
+A Caddy site block is keyed by its address, which becomes the section
+name directly ("=example.com"; '.' is ordinary). A bare directive
+("file_server") is a presence flag; a directive with arguments is a
+whitespace list - and a '*' matcher among those arguments is just a
+literal element.
+
+original (Caddyfile):
+
+        example.com {
+            root * /var/www
+            file_server
+            reverse_proxy /api/* localhost:9000
+        }
+
+NINI:
+
+        =example.com
+          root[] * /var/www
+          file_server
+          reverse_proxy[] /api/* localhost:9000
+
+
+----------------------------------------------------------------
+21. wpa_supplicant.conf   (repeated network blocks)
+----------------------------------------------------------------
+
+exercises: repeated 'network={}' -> '*'; quoted strings -> bare values
+
+Repeated "network={ }" blocks are an auto-index list. wpa quotes its
+string values ("HomeNet"); having no special characters, they become
+bare NINI values.
+
+original (wpa_supplicant.conf):
+
+        ctrl_interface=/run/wpa_supplicant
+        network={
+            ssid="HomeNet"
+            priority=5
+        }
+        network={
+            ssid="Cafe"
+            key_mgmt=NONE
+        }
+
+NINI:
+
+        ctrl_interface /run/wpa_supplicant
+        =network *
+          ssid HomeNet
+          priority 5
+        =network *
+          ssid Cafe
+          key_mgmt NONE
+
+
+----------------------------------------------------------------
+22. HAProxy haproxy.cfg   (compound directives)
+----------------------------------------------------------------
+
+exercises: 'timeout connect' -> sub-section; repeated 'server' -> '*'
+
+HAProxy has compound directives like "timeout connect 5000" / "timeout
+client 50000" - two words then a value. Rather than fight the space,
+group them as a "=defaults timeout" sub-section with "connect" /
+"client" keys. Repeated "server" lines are an auto-index record list,
+and a trailing "check" is a presence flag. (HAProxy's "defaults" apply
+implicitly; to make that sharing explicit, a backend could pull them
+with '&', as ssh does - 6., 11.)
+
+original (haproxy.cfg):
+
+        defaults
+            mode http
+            timeout connect 5000
+            timeout client 50000
+        backend servers
+            balance roundrobin
+            server s1 10.0.0.1:80 check
+            server s2 10.0.0.2:80 check
+
+NINI:
+
+        =defaults
+          mode http
+        =defaults timeout
+          connect 5000
+          client 50000
+        =backend servers
+          balance roundrobin
+        =backend servers server *
+          name s1
+          addr 10.0.0.1:80
+          check
+        =backend servers server *
+          name s2
+          addr 10.0.0.2:80
+          check
+
+
+----------------------------------------------------------------
+23. ISC dhcpd.conf   (multi-token brace headers)
+----------------------------------------------------------------
+
+exercises: brace blocks -> sections; multi-token headers -> multi-segment paths
+
+Like BIND (3.), dhcpd uses brace blocks, but its block headers carry
+several tokens: "subnet 10.0.0.0 netmask 255.255.255.0 { }" becomes a
+four-segment path. Compound option names ("option routers", "hardware
+ethernet") are joined; a MAC keeps its ':' verbatim; a two-value
+"range" is a whitespace list.
+
+original (dhcpd.conf):
+
+        option domain-name "example.com";
+        default-lease-time 600;
+        subnet 10.0.0.0 netmask 255.255.255.0 {
+            range 10.0.0.100 10.0.0.200;
+            option routers 10.0.0.1;
+        }
+        host printer {
+            hardware ethernet 00:11:22:33:44:55;
+            fixed-address 10.0.0.50;
+        }
+
+NINI:
+
+        option-domain-name example.com
+        default-lease-time 600
+        =subnet 10.0.0.0 netmask 255.255.255.0
+          range[] 10.0.0.100 10.0.0.200
+          option-routers 10.0.0.1
+        =host printer
+          hardware-ethernet 00:11:22:33:44:55
+          fixed-address 10.0.0.50
+
+
+----------------------------------------------------------------
+NOTES - where NINI's rules change the shape
+----------------------------------------------------------------
+
+NAMES CANNOT CONTAIN '/'. Anything path-like or pattern-like used as
+an identifier (an nginx location, an Apache <Directory>, a filesystem
+path used as a KEY, an editorconfig glob) cannot be a segment name.
+Idiom: make the records an auto-index list and put the path/glob in a
+value (4., 5., 8., 11.). Paths and globs as VALUES are fine - values
+are verbatim (2., 3.).
+
+VALUES ARE VERBATIM, TYPING IS READ-SIDE. "yes", "80", "false",
+"3.14" all stay strings; the consumer decides via get_bool/get_int/
+etc. None of the formats above needed quoting except a literal '#',
+which would (1.).
+
+EXPLICIT SHARING INSTEAD OF IMPLICIT WILDCARDS. Where a format applies
+a block to many targets by pattern (ssh "Host *"), NINI prefers an
+abstract template + '&' so the sharing is visible and the result is
+fully materialized (6.). This trades terseness for transparency.
+
+NO BLOCK DELIMITERS OR STATEMENT TERMINATORS. Braces ('{','}'), tags
+('<X>','</X>') and ';' all vanish; structure is the '=' path and the
+line break (3., 4., 5., 20., 21., 23.). Indentation in every NINI
+sample above is cosmetic - keys attach to the most recent header,
+never to a column.
+
+REPEATED BLOCKS -> '*'. nginx upstream servers, Apache vhosts, TOML
+[[tables]], fstab rows, editorconfig sections, cron jobs, XML repeated
+elements, wpa networks, HAProxy servers: all the same auto-index idiom
+(4., 5., 7., 8., 11., 16., 17., 21., 22.).
+
+SPACES IN NAMES -> JOIN OR NEST. Several formats put spaces inside a
+group or key name (Samba "read only", HAProxy "timeout connect", a
+.desktop "[Desktop Entry]" group, dhcpd "option routers"). NINI
+tokenizes on whitespace, so none can be a single name: keys are joined
+("read_only"), and multi-word headers become path segments or
+sub-sections (12., 18., 22., 23.).
+
+THE '[...]' SUFFIX IS ALWAYS A LIST. A bracket after a key is the list
+separator (7.), so a format that uses brackets for something else
+collides: a .desktop locale key "Name[de]" would be read as list key
+"Name" split on "de". Spell the locale another way - a dotted key
+"Name.de", or a sub-section (12.).
+
+NO INTERPOLATION. "$var", "${...}" and the like are stored verbatim;
+NINI never expands them. Postfix's "$mydomain" stays literal text for
+the consumer to resolve (14.).
+
+DOTTED KEYS ARE FLAT. NINI splits paths on whitespace, never on '.',
+and '.' is an ordinary name character - so a .properties key
+"log.file.path" is ONE key, not a path. Promote the prefixes to
+sections only if real nesting is wanted (13.).
+
+FAMILIAR SYMBOLS, FAMILIAR INSTINCTS. NINI did not invent its glyphs
+in a vacuum. HCL's block labels are a path, just like "=a b c" (9.).
+YAML reaches for '&' (anchor) and '*' (alias) to share a node; NINI
+reaches for '&' (inherit) and '*' (abstract) for the same job, roles
+swapped (10.). And the whole line syntax descends from the DECOR
+definition language (see the spec's LINEAGE note). The translations
+above are less "encoding X in NINI" than "spelling X's good ideas with
+one consistent set of rules".

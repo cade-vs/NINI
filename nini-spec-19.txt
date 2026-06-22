@@ -1,0 +1,1184 @@
+================================================================
+
+            NINI (Not INI) - FORMAT SPECIFICATION
+
+                      working draft
+
+2026 (c) Vladi Belperchinov-Shabanski "Cade" <cade@noxrun.com>
+
+            https://cade.noxrun.com/projects/NINI
+            https://github.com/cade-vs/NINI
+
+================================================================
+
+         DESIGN NOTES AND IMPLEMENTATION DETAILS
+
+                       see also:
+
+  NINI BY EXAMPLE - translating popular config formats to NINI
+                  (nini-examples.txt)
+
+================================================================
+Status: design consolidated. Open items flagged [OPEN] / [REC]
+(REC = recommended default, not yet ratified).
+Inspired by the DECOR definition language: github.com/cade-vs/perl-decor
+
+
+----------------------------------------------------------------
+0. PHILOSOPHY
+----------------------------------------------------------------
+
+NINI is a minimal, line-oriented configuration format. Two ideas
+drive every decision:
+
+  (1) The parser stores values VERBATIM as strings. It performs no
+      type inference and no coercion. Meaning is assigned by the
+      consumer at read time.
+
+  (2) There is ONE container kind: the map (ordered set of named
+      entries). "Arrays" are not a parser concept - they are a
+      read-side convention over entries whose names are integers.
+
+Loading multiple files in order merges them into one tree: later
+entries override earlier ones (9.). @include pulls one file into
+another the same way: it inherits the accumulated STRUCTURE (merge
+state) but not the current SECTION CONTEXT - it starts at root and
+restores the parent's path on return (8.). Layering/override is
+therefore just "later entries merge over earlier ones".
+
+LINEAGE: NINI's line syntax derives from the DECOR definition
+language - the ".def" table definitions of the DECOR information-
+systems infrastructure (github.com/cade-vs/perl-decor). The shared
+DNA is the '=' record/section header with attribute lines beneath it,
+verbatim "key value" lines, '#' comments, the '@' include/inherit
+directive, and the stack-and-override layering of several files into
+one result. NINI keeps that skeleton and drops everything tied to an
+IS data model - field types, permissions, SQL, i18n labels - while
+generalizing DECOR's flat table->field shape into arbitrary-depth
+nested maps. Key differences:
+
+  - DECOR '=field' is one level deep (table -> fields); NINI '=a b c'
+    nests to any depth, paths are absolute.
+
+  - DECOR's single '@include <table> <fields>' both pulled files and
+    copied fields; NINI splits the roles - '@include' for files (8.),
+    '&' for section-to-section copy (11.).
+
+  - DECOR field-list wildcard '*' and '_'-prefixed core templates
+    (_DE_*) reappear as NINI's '*' auto-index (5.) and '*'-prefixed
+    abstract sections (12.); DECOR's '-field' removal is the reserved
+    leading '-' (subtractive keys, not yet defined); DECOR's '@remove'
+    maps onto NINI's '!' / '!!' clears (10.).
+
+  - NINI values are always verbatim strings with read-side typing; it
+    adds presence-flag keys (3.), standalone clear lines and abstract
+    sections, and a file-relative @include with cycle/depth guards.
+
+
+----------------------------------------------------------------
+1. NOT INI  (how NINI differs from a classic INI file)
+----------------------------------------------------------------
+
+The name is the disclaimer: NINI is "Not INI". It looks INI-ish at a
+glance - line-oriented, sections, a key then a value - but it differs
+on purpose at almost every point where an INI file makes a choice.
+This section is the quick orientation for anyone arriving from a
+.ini / .conf background; the precise rules follow from 2. onward.
+
+What looks familiar:
+  - one declaration per line; a line beginning with '#' is a comment
+  - a file is a flat stream of section headers and key/value lines
+  - human-editable, no surrounding document syntax
+
+What is different (and why):
+  - SECTIONS NEST TO ANY DEPTH. INI sections are flat "[name]" labels
+    (a few dialects fake one level with "[a.b]" or '[a "b"]'). NINI
+    writes a path of whitespace-separated segments, "=a b c", nesting
+    to any depth (4.). There are no '[' ']' brackets.
+  - KEY AND VALUE ARE SPLIT BY WHITESPACE, not '=' or ':'. You write
+    "port 8080", not "port = 8080". The first token is the key; the
+    rest of the line is the value (3.).
+  - VALUES ARE VERBATIM STRINGS. No type guessing and no required
+    quoting: "yes", "80", "3.14" are just text, typed by the consumer
+    at read time (3.). Quotes appear only to protect leading/trailing
+    spaces, or the list separator inside an element
+    (7.). INI
+    tools each invent their own typing and quoting; NINI fixes one
+    rule - verbatim.
+  - ONE CONTAINER, REAL LISTS. INI has no standard array. NINI has a
+    single container (the ordered map) and two list idioms over it:
+    inline / multi-line "key[]" lists (7.), and integer-keyed records
+    via the '*' auto-index (5.).
+  - LAYERING IS DEFINED. Loading several files merges them, later over
+    earlier; re-entering a section merges into it; lists append (9.).
+    Classic INI has no portable merge/override story.
+  - OPERATORS INI HAS NO NOTION OF: '@include' to compose files (8.),
+    '!' / '!!' to clear (10.), '&' to inherit one section into another
+    (11.), and '*'-led abstract sections - templates pruned from the
+    output (12.).
+  - INDENTATION IS COSMETIC. It is for the eye only; a key attaches to
+    the most recent header, never to its column. INI has no nesting to
+    indent in the first place.
+
+Side by side - the same data in both:
+
+        ; classic INI
+        [database]
+        host = 127.0.0.1
+        port = 5432
+
+        [database.replica]
+        host = 127.0.0.2
+
+
+
+        # NINI
+        =database
+          host 127.0.0.1
+          port 5432
+
+        =database replica
+          host 127.0.0.2
+
+The INI on top needs a dialect that understands dotted section names
+to express the nesting; NINI's "=database replica" is a plain two-
+segment path with no special casing. Everything past this section
+spells out the rules these examples lean on.
+
+
+----------------------------------------------------------------
+2. LEXICAL STRUCTURE
+----------------------------------------------------------------
+
+Encoding : UTF-8 always. A BOM, if present, is stripped.
+Lines    : LF ('\n') is the line separator. A trailing CR before
+           LF (i.e. CRLF input) is stripped for tolerance, but LF
+           is canonical; lone CR is not a separator.
+Blank lines are ignored.
+
+A logical line is produced in this order:
+  a) if the first non-whitespace character is '#', the whole line is a
+     comment - discard it (6.)
+  b) classify by first non-space character:
+       '='  -> SECTION HEADER  (4.)
+       '*'  -> ABSTRACT SECTION HEADER (12.)
+       '@'  -> DIRECTIVE        (8.)
+       '!'  -> CLEAR LINE       (10.)
+       '&'  -> INHERIT LINE     (11.)
+       else -> KEY LINE         (3.)
+
+Leading whitespace is IGNORED and carries no meaning. Indentation is
+cosmetic only - it does NOT set nesting. A key always attaches to
+the most recent section header, regardless of how it is indented.
+Level changes ONLY via headers (4.). Conventional layout: indent
+keys under their section, and put a blank line before each header.
+
+Names (section path segments AND key names):
+  charset = [A-Za-z0-9:._/-]+
+  - no whitespace, no '*', no quotes (and never '#' - a leading '#'
+    makes the whole line a comment; '#' is not a name character)
+  - ':' '.' '-' '/' are ORDINARY name characters (no special meaning);
+    names can look like 127.0.0.1, host:port, /static, /var/www, or
+    etc/ssl/relay.pem
+  - a SECTION PATH SEGMENT may begin with any charset character (so
+    /static and 10.0.0.0 are valid segments)
+  - a KEY may begin with any charset character EXCEPT '-' or '.' (nor
+    '+', which is not a charset character at all). Those are reserved
+    as leading key operators (the planned subtractive '-key', composite
+    '.key', additive '+key'). A key may still begin with ':' or '/' and
+    may contain '-' or '.' after the first character - so /etc/hostname
+    is a valid key, but -foo and .bar are not
+  - '*' is reserved - the auto-index allocator (5.) and the leading
+    abstract-section marker (12.); never a literal name character
+  Formally, once a token has been isolated (whitespace has already
+  split it off; the line is not a full-line comment and quotes are
+  already handled):
+
+        section path segment    ^[A-Za-z0-9:._/-]+$
+        key name                ^[A-Za-z0-9_:/][A-Za-z0-9:._/-]*$
+
+  They differ only in the first character: a segment leads with any
+  charset character; a key may not lead with '-' or '.' (nor '+'),
+  which are held for key operators.
+  Names are case-sensitive.                                 [REC]
+
+
+----------------------------------------------------------------
+3. KEY LINES
+----------------------------------------------------------------
+
+        key value
+
+The first whitespace-delimited token is the key (must match the
+name charset). Everything after the first run of whitespace is the
+value, taken VERBATIM (no tokenising, no inference).
+
+        port 8080            key "port"   value "8080"   (string)
+        msg hello   world    key "msg"    value "hello   world"
+        ratio 3.14           key "ratio"  value "3.14"   (string)
+        id 00012345          key "id"     value "00012345" (zeros kept)
+
+Bare key (no value after it) - PRESENCE FLAG:
+
+        debug                value "1"  (presence flag)            [REC]
+
+A key that is present but carries no value defaults to "1". It is a
+PRESENCE FLAG: writing the key at all means "on / set", so it reads
+true under get_bool and "1" under get(). "No value" means nothing
+but whitespace follows the key.
+
+        debug                value "1"   (bare)
+        debug                value "1"   (trailing whitespace only)
+
+To set an EXPLICIT empty string, quote it - quoting is the only way
+to distinguish "present but empty" from the presence flag:
+
+        debug ""             value ""    (explicit empty string)
+
+Contrast with ABSENT: a key that never appears is not in the map at
+all; get() returns "" for it (see below). So three states exist:
+
+        absent      -> not in the map; get() yields ""
+        valueless   -> present; value "1"
+        empty ("")  -> present; value "" (written by quoting)
+
+Value typing happens ONLY on the consumer side:
+
+        get(key)             -> verbatim string ("" if the key is ABSENT;
+                                a present valueless key yields "1")
+        get_int(key, dflt)   -> parsed at read time
+        get_bool(key, dflt)  -> parsed at read time
+        get_float(key)       -> parsed at read time
+        get_list(key)        -> list of strings (7.)
+
+
+----------------------------------------------------------------
+4. SECTION HEADERS
+----------------------------------------------------------------
+
+A header sets the current path that following key lines attach to.
+
+        =                    return to ROOT
+        =a                   path: a
+        =a b                 path: a -> b
+        =a b c               path: a -> b -> c   (any depth)
+
+Exactly one leading '='. Depth is the number of whitespace-
+separated segments, NOT a count of '=' signs. Each segment is a
+name (charset of 2.). There is no dotted-path and no '=='-counting;
+both were removed.
+
+A header creates intermediate maps as needed (a, then a.b, then
+a.b.c) and leaves the current path at the deepest segment.
+
+ONE NAMESPACE PER NODE. A key name and a child-section name share the
+same namespace: a name is a single slot holding EITHER a scalar/list
+OR a subsection, never both. This is deliberate - it keeps a NINI tree
+a plain nested map (the JSON / dict mapping), and avoids the XML-style
+split between element children and attributes. If the same name is
+used both ways, the LATER use wins and replaces the earlier: a
+'=a b' header turns an existing scalar 'b' under 'a' into a subsection,
+and a 'b value' key turns an existing subsection 'b' into a scalar. A
+reader MAY warn on such a cross-type replacement, since it is usually
+a mistake rather than intent.
+
+A header may instead begin with '*' to define an ABSTRACT section -
+identical in every parse-time way but pruned from the output at the
+end (12.). '*name ...' is exactly '=*name ...' with the '=' elided;
+the '*' marks the root segment's name. '=name' and '*name' are
+distinct sections.
+
+Re-entering an existing path MERGES into it (9.); it never clears
+unless a clear flag is present (10.). A header may carry clear
+operators: '!' (clear keys) and '!!' (clear subtree), each acting on
+the current path where it appears; '!' may repeat, they compose, and
+bare =! / =!! act on root. Full grammar is in 9.
+
+examples:
+
+        =office server database
+                ip  192.168.11.222
+        =backup server database
+                ip  192.168.22.111
+        # alternatively
+        =servers office database
+                ip  192.168.11.222
+        =servers backup database
+                ip  192.168.22.111
+
+are two different config schemas, one prioritizing the location first
+and second to prioritize the server list, then location, json would be:
+
+        {
+          "office": {
+            "server": {
+              "database": {
+                "ip": "192.168.11.222"
+              }
+            }
+          },
+          "backup": {
+            "server": {
+              "database": {
+                "ip": "192.168.22.111"
+              }
+            }
+          }
+        }
+
+and
+
+        {
+          "servers": {
+            "office": {
+              "database": {
+                "ip": "192.168.11.222"
+              }
+            },
+            "backup": {
+              "database": {
+                "ip": "192.168.22.111"
+              }
+            }
+          }
+        }
+
+
+----------------------------------------------------------------
+5. AUTO-INDEX  '*'  (the "array" convention)
+----------------------------------------------------------------
+
+'*' may appear as a path segment. It resolves, at the moment it is
+processed, to the next integer name under its parent:
+  resolution:
+    1. look at the sibling entry names at this level
+    2. of those parseable as a base-10 integer, take the max VALUE
+    3. '*' becomes (max + 1), written as a canonical decimal string
+    4. if none parse as integer, '*' becomes "0"
+
+Leading zeros: '*' compares by integer VALUE, ignoring formatting.
+Keys "6" and "06" both count as 6; '*' after them yields "7". Both
+"6" and "06" remain as distinct stored keys (consistent, if untidy
+- a consequence of writing two keys that denote the same integer).
+
+Empty parent: first '*' is "0".
+
+'*' is usable anywhere in a path, not only the last segment:
+
+        =servers *           append element under servers
+        =servers * tls       descend into 'tls' of the new element
+
+'*' is NEVER a literal name. To have a key literally "*", you can't
+(reserved). [If ever needed it would require a quoting rule on
+names, which NINI currently does not have.]
+
+The auto-index '*' and the abstract-section marker '*' (12.) never
+collide: the marker is only ever the FIRST character of a header line,
+while the auto-index allocator is only ever a later path segment. A
+lone '*' on a line is the auto-index segment, never an abstract header
+(the marker needs a name after it).
+
+Negative / non-integer names: a name like "-3" or "x1" is just an
+ordinary string key. It is stored verbatim and IGNORED by the '*'
+scan (only ^[0-9]+$ names participate). NINI has no built-in
+reverse-indexing; if a consumer wants "-1 = last" semantics that is
+its own read-side choice, not part of the format.
+
+Worked example (canonical style: keys indented, blank line before
+each section header):
+
+        =servers *
+          # this element becomes key "0"
+          host a
+        =servers *
+          # key "1"
+          host b
+        =servers 7
+          # explicit key "7"
+          host f
+        =servers *
+          # max(0,1,7)+1 -> key "8"
+          host g
+        =servers relay-x
+          # string key, ignored by '*'
+          host x
+
+will become (in json example)
+
+        # Tracing the * auto-index (max existing integer key + 1, rest ignored):
+        #    * -> no numeric keys yet -> 0 (host a)
+        #    * -> max(0)+1 -> 1 (host b)
+        #    7 -> explicit -> 7 (host f)
+        #    * -> max(0,1,7)+1 -> 8 (host g)
+        #    relay-x -> string key, doesn't affect * counter (host x)
+        {
+          "servers": {
+            "0": { "host": "a" },
+            "1": { "host": "b" },
+            "7": { "host": "f" },
+            "8": { "host": "g" },
+            "relay-x": {"host": "x"}
+          }
+        }
+
+READ-SIDE CONTRACT (consumer behaviour, not parser):
+A map MAY be read as an ordered list by selecting entries whose
+names match ^[0-9]+$ (or canonical ^(0|[1-9][0-9]*)$ if the
+consumer is strict), sorting by integer value, and ignoring
+non-integer keys. Holes (missing indexes) are the consumer's
+policy - skip, null-fill, or error. The format itself is sparse
+and never fills gaps.
+
+more key examples:
+
+        05 will not be considered 5, no conversion is done at all, 05 may
+           carry different semantic and is used as-is.
+        5  will be considered valid integer key and will be counted by the
+           read-side logic.
+        0  is valid integer as 5.
+        00 is not! just as-is string.
+        *  is just a shortcut to list multiple things of the same parent name
+           without specifying own names.
+
+
+----------------------------------------------------------------
+6. COMMENTS
+----------------------------------------------------------------
+
+To keep parser as simple as possible, only line comments are allowed.
+All lines starting with optional whitespace and "#" will be considered
+comment text and will be discarded.
+
+"#" is only special in line comments, in all data values (scalars and arrays)
+it is just regular data. i.e. #aabbcc css color or C# will be fine:
+
+        bg   #fff             ->   value "#fff"
+        url  http://h/x#frag  ->   value "http://h/x#frag"
+        lang C#               ->   value "C#"
+        note a # b            ->   value "a # b"   (whole rest of line)
+
+To attach an explanation to a line, put a full-line comment ABOVE it,
+indent to taste:
+
+                    # TCP port the switch listens on
+        listen      8583
+
+----------------------------------------------------------------
+7. SCALAR LISTS AND QUOTING
+----------------------------------------------------------------
+
+The bracket suffix "key[...]" makes a key a LIST. What sits between
+the brackets is the element SEPARATOR; an empty bracket means split on
+whitespace. Lists DISCARD whitespace around and between elements -
+unlike scalar values, which keep it verbatim (3.).
+
+Whitespace-delimited (the default):
+
+        hosts[] relay-1 relay-2 relay-3   -> ["relay-1","relay-2","relay-3"]
+
+Runs of whitespace collapse, so spacing and alignment never create
+empty elements. To keep whitespace INSIDE an element, quote it:
+
+        tags[] "two words" solo           -> ["two words","solo"]
+
+Cited separator - the first non-whitespace run between the brackets is
+the literal delimiter:
+
+        ports[,] 80, 443, 8080            -> ["80","443","8080"]
+        module[::] Data::Tools::ACME      -> ["Data","Tools","ACME"]
+        cmd[|] start | stop | reload      -> ["start","stop","reload"]
+
+The separator is a STRING, not a single character (so "::" splits a
+Perl-style name correctly). With a cited separator each element is
+trimmed of surrounding whitespace; the split is literal, left to
+right, non-overlapping. A separator cannot contain ']' (which closes
+the bracket) nor '"' (which would open a quoted element).
+
+Bracket contents: leading/trailing whitespace inside the brackets is
+ignored, and the FIRST non-whitespace run is the separator - so "[ ; ]"
+means ';', and "[   ]" is the same as "[]" (whitespace default). If
+more than one run appears inside the brackets, the first is used and a
+warning is issued when debug is enabled.
+
+Multi-line list (append) - the separator is per line; results append,
+and lines may even differ in how they split:
+
+        hosts[] relay-1 relay-2
+        hosts[,] relay-3, relay-4         -> ["relay-1","relay-2","relay-3","relay-4"]
+
+Empty list:
+
+        tags[]                            -> []   (not [""])      [REC]
+
+NOTE: the empty-list rule is independent of the scalar presence-flag
+rule (3.). A valueless SCALAR key is "1"; a valueless LIST key
+(key[]) is the empty list []. The "[]" suffix selects which.
+
+QUOTES (values and list elements):
+A value or element is QUOTED only when its FIRST character is a quote -
+either ' or ". That opening quote is the DELIMITER for the span; the
+span ends at the next occurrence of the SAME character that is not
+doubled. Quotes are therefore needed ONLY to:
+  - preserve leading or trailing whitespace,
+  - embed the list separator as data.
+Otherwise quotes are unnecessary.
+
+Inside a quoted span:
+  - the OTHER quote character is ordinary data (no escaping)
+  - the DELIMITER is embedded by DOUBLING it (RFC-4180 / CSV style):
+    '' inside a '..' span is one literal ', "" inside a ".." span is
+    one literal "
+  - whitespace and the separator are literal
+
+A quote that is NOT the first character is ordinary data - so an
+UNQUOTED value runs verbatim to the delimiter and may contain quotes
+freely (owner O'Brien -> O'Brien). The closing delimiter must be the
+same character as the opener and must end the value/element; the two
+quote characters never mix within one span.
+
+        desc "  hi  "            "  hi  "        (whitespace kept)
+        owner O'Brien            O'Brien         (bare quote = data)
+        a 'has "double" inside'  has "double" inside
+        b "it's ok"              it's ok         (other quote inside, no escaping)
+        c "the other: '"         the other: '    (no doubling needed)
+        d 'isn''t'               isn't           (doubled delimiter)
+        tags[,] 'a,b', "c'd"     ["a,b", "c'd"]  (per-element quoting)
+
+UNTERMINATED QUOTE: a value/element that opens a quote with no matching
+close on the line is a PARSE ERROR (report the line number). No
+swallow-to-EOL.
+
+AFTER THE CLOSING QUOTE: once a quoted span closes, the quoted text IS
+the whole value (for a scalar) or the whole element (in a list). The
+closing quote must be followed by whitespace, the list separator, or
+the end of the line. When it is:
+  - for a SCALAR value, any whitespace and further data after the
+    closing quote, to end of line, is IGNORED - there is nothing left
+    to parse once the quote has closed, so trailing tokens are dropped
+    (silently; the debug reader may log them).
+  - in a LIST, the whitespace or separator after the closing quote ends
+    that element; the next token begins the next element as usual.
+A NON-WHITESPACE, non-separator character GLUED directly to the closing
+quote (port "80"x, a "b"c) is a PARSE ERROR: the quote did not end the
+token cleanly. This keeps the rule simple - a quoted token is "a clean
+quoted span followed by a boundary," never "a quoted span fused into
+more text."
+
+        port "8583" extra junk   value "8583"    (trailing dropped)
+        host "10.0.0.1"          value "10.0.0.1"
+        bad  "8583"x             PARSE ERROR      (glued after close)
+
+
+----------------------------------------------------------------
+8. DIRECTIVES
+----------------------------------------------------------------
+
+        @include FILE
+        or
+        @inc     FILE
+
+The included file's logical lines are processed into the SAME
+accumulating tree, so the include is MERGE-RELATIVE: it sees and
+merges over all data accumulated so far (later data overrides
+earlier, per 8.). But it is NOT PATH-RELATIVE: the included file
+does not inherit the section that happens to be open at the
+@include line.
+
+Each included file forces first section to be root '='! So any keys
+at the beginning of the file, without mention of a section name are
+assumed to be root keys.
+
+PATH CONTEXT - stated as the algorithm (everything else follows):
+  Process input strictly line by line, maintaining a CURRENT
+  SECTION (the path new keys attach to):
+    KEY line    -> merge into the current section
+    HEADER line -> set the current section
+    @include    -> PUSH current section onto a stack;
+                   set current section = ROOT;
+                   process the included file line by line (recurse);
+                   POP the stack -> restore current section
+
+From this single rule, every "visibility" property follows
+automatically, with no extra machinery:
+  - the include SEES the structure and the current section's keys
+    AS THEY STAND AT THE @include LINE, because those lines already
+    executed before it
+  - the include does NOT see keys added to that section AFTER the
+    @include line, because those lines have not executed yet
+  - the include starts at ROOT (the set-root step) and addresses
+    sections by full path
+  - the parent resumes its exact section after the include (the
+    pop step); the include is transparent to the parent's cursor
+
+So @include inherits accumulated STRUCTURE (merge state up to that
+line) but not SECTION CONTEXT (it runs from root; the parent's
+cursor is pushed/popped around it).
+
+STYLE: because the included file's section navigation is invisible
+to the parent and its data merges by full path, an @include reads
+most clearly when placed BEFORE opening new sections. Mid-section
+placement still works (the pop restores the parent's section) and
+never breaks already-seen data; it is just less obvious to a reader.
+
+Top-level loading is consistent: each file given to the loader
+begins at ROOT, exactly as the set-root step does for an include.
+
+If there are keys after @include they will be added to the last seen
+section before the @include!
+
+FILE name is searched in a list of directories, given to the loader.
+If current path must be available, the list have to contain "." i.e.
+current directory. For safety no default list of directories is assumed!
+
+Loops are detected: re-including a file already on the include seen list
+is a PARSE ERROR.
+
+
+----------------------------------------------------------------
+9. MERGE MODEL (layering / override)
+----------------------------------------------------------------
+
+Files are processed in order; later entries merge over earlier.
+"Merge, never clear" is the rule:
+  - scalar key seen again   -> value REPLACED, last wins, SILENTLY.
+                               No warning by default: a later value
+                               overriding an earlier one is the whole
+                               point of layering, so it is normal,
+                               not an error condition. (A reader MAY
+                               offer an opt-in debug/verbose mode that
+                               logs overwrites, to help trace which
+                               layer set a value - off by default.)
+  - section header seen again-> NAVIGATION: re-enters that path and
+                               merges. It clears nothing. Re-entering
+                               an existing section is ordinary, not a
+                               duplicate.
+  - list key (key[]) seen   -> APPENDS across files (extend-only)
+
+Nothing shortens a list or deletes a subtree implicitly. The only
+way to remove inherited data is an explicit clear flag (10.).
+
+This is what makes a base file + override file(s) work: the base
+defines a generic structure; overrides patch it by re-entering
+sections and replacing scalar values.
+
+A presence flag obeys the same last-wins rule: re-stating "debug"
+(value "1") over an earlier explicit "debug 0" replaces it with "1",
+and vice versa - order decides, like any scalar.
+
+
+----------------------------------------------------------------
+10. CLEAR FLAGS
+----------------------------------------------------------------
+
+There are two clear OPERATORS. They are orthogonal (independent
+axes) and POSITIONAL: each acts on the CURRENT PATH at the point in
+the header where it appears (the segment just resolved, or ROOT if
+no segment precedes it).
+
+        !    clear the current node's KEYS      (branches kept)
+        !!   clear the current node's SUBTREE   (all branches but keys kept)
+
+INTENDED USE - two carriers, two jobs. The SAME operators ride on two
+kinds of line, and the line kind signals intent:
+  - in a HEADER (=server ! http, =upstream !!) the flag is the
+    structural OVERRIDE mechanism: it is how a later layer or an
+    @include patches an inherited tree (9.). This form is
+    load-bearing and belongs in real, shipping configs.
+  - on its OWN line (a STANDALONE CLEAR LINE, below) the flag is a
+    throwaway MUTE: drop it in to silence a section while testing or
+    debugging, pull it out to restore. Mostly a test/debug aid - it
+    is not the layering tool - though it can also cover the odd
+    corner case where you must wipe the CURRENT node in place without
+    navigating (which a header flag, being absolute, cannot do).
+
+Rule of thumb: reach for a header flag to LAYER, a standalone line to
+MUTE. Neither is the other's substitute.
+
+A FLAG TOKEN is a maximal whitespace-delimited run of '!'. It is a
+single token; '!' and '!!' are NOT joined across whitespace. The
+run length selects the effect:
+
+        1 bang  ->  clear keys
+        2 bangs ->  clear subtree
+        3+ bangs->  clear BOTH (pure syntactic sugar for the token pair
+                    "! !!"; e.g. !!! == !!!!!!!! == "! !!")
+
+So both "=x !!!" (one 3-run token) and "=x ! !!" (two tokens) clear
+x's keys and subtree; equivalent in effect, merely parsed as one vs
+two tokens.
+
+Flags compose left to right with segments. Names cannot contain
+'!', so a flag token is never confused with a segment.
+  - '!' may appear MULTIPLE times in a header as separate tokens
+    (clear keys at several levels as you descend)
+  - within ONE token, bang-count maps 1->keys, 2->subtree,
+    3+->both (sugar for "! !!")
+  - '!!' on a node is total for its subtree; repeating it on the
+    same node is pointless
+  - a '!' token and a '!!' token adjacent on the SAME node clear
+    both axes of that node (keys + subtree) - same as one 3+ token
+
+Processing: resolve each segment (create/enter), updating the
+current path; when a flag is reached, apply it to the current node;
+continue. The final current path is where following key lines
+attach.
+
+Examples:
+
+        =server !            clear server's keys; path = server
+        =server !!           clear server's subtree; path = server
+        =server ! !!         clear server's keys AND subtree; path = server
+        =server ! http       clear server's keys, descend http (kept);
+                             path = server.http
+        =server !! http      clear server's subtree, descend a fresh http;
+                             path = server.http
+        =servers ! !! relay-5
+                             clear servers entirely (keys + subtree), then
+                             descend relay-5; path = servers.relay-5
+        =a ! b ! c           clear a's keys, descend b, clear b's keys,
+                             descend c; path = a.b.c
+        =!                   clear ROOT's top-level keys; sections kept
+        =!!                  clear ROOT's subtree (all top-level sections);
+                             root's own top keys kept
+        =! !!                clear ROOT entirely - top keys AND all sections
+                             (the total-reset hammer; e.g. replacing an
+                             immutable base template)
+        =!!!                 the same as "=! !!" or any "=!!!!!!!" etc.
+
+NOTE on mid-path '!': it clears the keys of the node it sits on, NOT
+the node you next descend into. =server ! http keeps any existing
+http child and merges into it.
+
+For an integer-keyed (array-style) map, the elements ARE the
+subtree: '!!' drops all elements, while '!' (keys) is a no-op on a
+pure index map (it has no non-integer keys). A node mixing scalar
+keys and integer-keyed elements clears them independently: '!' the
+keys, '!!' the elements.
+
+A clear acts at the POSITION it appears in the concatenated stream:
+it removes what has accumulated SO FAR; lines after it merge on top
+normally, and a later layer may clear again.
+
+Clearing a path that does not exist is a no-op (silently fine).
+
+STANDALONE CLEAR LINES:
+A line whose first non-whitespace character is '!' is a CLEAR LINE,
+not a key line ('!' is not a name character, so such a line was never
+a valid key). It carries a flag token (a run of '!') and acts on the
+CURRENT SECTION - the path set by the most recent header - by run
+length, exactly like a header flag:
+
+        !       clear the current section's KEYS
+        !!      clear the current section's SUBTREE
+        !!!     clear BOTH        (3+ bangs, as elsewhere)
+
+Unlike a header flag, a standalone clear line does NOT move the
+cursor: the current section is unchanged, so key lines after it keep
+attaching to the same section. The clear acts at its stream position
+(it removes what has accumulated SO FAR in that section), per the
+positional rule above.
+
+PURPOSE: PRIMARILY a test/debug aid - a quick, reversible "mute".
+Drop a clear line into a section to make its accumulated data vanish
+from the parsed result while the source lines stay physically in the
+file; delete the one clear line to restore them - no hand-commenting
+a block. It is NOT the layering/override tool (that is the header
+flag; see the top of this section, and 8.). It MAY, however, also
+serve the occasional legitimate corner case: wiping the CURRENT node
+in place when you do not want to navigate away from it - something a
+header flag cannot do, since headers are absolute and re-enter from
+root. So: expect to see standalone clear lines mostly during testing
+and debugging, but treat them as valid syntax that can carry a real
+intent too.
+
+        =cache
+          backend redis
+          host 10.0.0.5
+          ttl 300
+          # debug: blank out =cache's keys, lines kept
+          !
+
+Here '!' empties =cache (its three scalar keys are KEYS). Use '!!' if
+the data to drop is sub-sections, or '!!!' for both. A clear line
+carries only flag tokens; any non-'!' content makes it a malformed
+clear line (error). Multiple flag tokens on one line compose
+left to right, same as in a header (e.g. "! !!" == "!!!"); the
+single-token forms above are the normal usage.
+
+Within a key VALUE, '!' / '!!' are ordinary characters; flags are
+recognised only at the START of a line - in a header (begins '=') or
+as a standalone clear line (begins '!').
+
+
+----------------------------------------------------------------
+11. INHERIT  '&'  (section-to-section copy)
+----------------------------------------------------------------
+
+'&' is the inheritance operator and the mirror image of the clear
+flag (10.): where '!' REMOVES data from the current node, '&' GRAFTS
+data into it, copied from another section already in the tree. The
+run-length scheme is the same:
+
+        &     copy the source section's KEYS into the current section
+        &&    copy the source section's SUBTREE
+        &&&   copy BOTH        (3+ ampersands, like the bang forms)
+
+Like a standalone clear line, '&' is its own line and acts on the
+CURRENT SECTION (the path set by the most recent header) without
+moving the cursor. The source is named by an ABSOLUTE path from root,
+exactly as a header addresses sections:
+
+        &server template1      copy keys of =server template1
+        &&server template1     copy its subtree
+        &&&servers base        copy keys + subtree of =servers base
+
+'&' is forbidden in a section header (headers use whitespace to
+separate segments, so '&' there would be ambiguous) and '*' is
+forbidden in a source path ('*' is an allocator, meaningless as a
+reference target). '&' is not a name character, so a line that begins
+with '&' is always an inherit line, never a key line.
+
+POSITIONAL, SNAPSHOT, NO POST-PASS:
+'&' is processed the instant it is read. It copies the source exactly
+as it stands AT THAT LINE - a deep copy by value, not a live link. The
+source must therefore already be defined: earlier in the same file, or
+in an earlier @include. Because the copy is a value snapshot with no
+live link, there is no recursion and no cycle detection to do (unlike
+@include, 7., which pulls a FILE and must guard cycles).
+
+OVERRIDE BY PLACEMENT:
+The copied entries merge into the current section at the '&' line's
+stream position, under the ordinary last-wins rule (9.). There are NO
+protected local keys; WHERE you put the '&' decides who wins:
+  - '&' at the TOP of a section -> template-as-defaults: your own keys
+    below override the inherited ones.
+  - '&' at the BOTTOM           -> template forced: inherited values
+    overwrite what you set above.
+  - '&' in the MIDDLE           -> exactly as the stream order reads.
+
+        =server template1
+          workers 4
+          timeout 30
+        # nested via full path (headers are absolute)
+        =server template1 tls
+          verify on
+
+        =server prod
+          # pull keys + subtree as a base
+          &&& server template1
+          # local override (after & => wins)
+          workers 16
+
+The result: server.prod = {workers:"16", timeout:"30", tls:{verify:
+"on"}}. Had "workers 16" come BEFORE the '&&&', the template's
+"workers 4" would have won instead.
+
+COPY SEMANTICS - REPLACE, NEVER MERGE:
+Each copied entry lands by NAME and DROPS any same-name entry already
+in the destination; there is no deep/recursive merge (merge is not
+obvious, so it is avoided):
+  - a scalar key replaces a same-name scalar
+  - a list key (key[]) REPLACES a same-name list - it does NOT append.
+    This is a deliberate exception to the cross-file append rule of
+    8.: with '&' you take the template's list AS yours.
+  - a child section replaces a same-name child ENTIRELY - the old
+    subtree is discarded, not merged into.
+
+AUTO-INDEX ELEMENTS ('*'-born children):
+The reader internally marks every entry created by '*' as auto-index.
+The mark is parse-only: it never appears in output and does not change
+the read-side list convention (5.). On a '&' copy it decides how a
+source child is placed:
+  - an EXPLICITLY-named child (a string name, or an explicit integer
+    such as =base 7) lands by name and replaces, as above.
+  - an AUTO-INDEX child ignores its source index entirely and is
+    APPENDED at the destination's next free index (max existing
+    integer sibling + 1, just like '*'), in arrival order, and stays
+    marked auto so a later '&' or '*' keeps counting.
+
+So auto elements never collide on "0", "1", ...; they re-index onto
+the destination's own running sequence:
+
+        =base *
+          # base.0  (auto)
+          host 10.0.0.1
+        =base *
+          # base.1  (auto)
+          host 10.0.0.2
+
+        =svc *
+          # svc.0   (auto)
+          host 10.5.5.5
+        =svc
+          # copy base's subtree into svc
+          && base
+
+The result: svc = {0:{host:"10.5.5.5"}, 1:{host:"10.0.0.1"},
+2:{host:"10.0.0.2"}}. The source's own 0/1 are discarded; each auto
+element takes the next free slot after svc.0. Had base's elements been
+written EXPLICITLY (=base 0 / =base 1), '&& base' would have replaced
+svc's own "0" and "1" by name, losing svc.0 - that name-vs-auto split
+is the whole reason the mark exists. Deeper auto-index grandchildren
+nested INSIDE a copied subtree ride along verbatim; re-indexing only
+touches the entries landing directly at the destination level.
+
+MISSING SOURCE - SILENT:
+Referencing a source path that does not exist is a SILENT no-op (the
+debug/verbose reader logs a warning; the default build says nothing).
+This is intentional and useful: a config can adapt to whatever is or
+is not present on a given system - inherit from an optional, system-
+dependent section if it happens to be defined, otherwise carry on
+unchanged. A not-yet-defined source and a never-defined source are the
+same case: nothing has accumulated under that path at the '&' line, so
+nothing is copied.
+
+BRANCH RESTRICTION - LATERAL ONLY:
+A '&' may inherit only from a SEPARATE branch. The source path may not
+lie on the current section's own vertical line: it may not be EQUAL to
+the current path, an ANCESTOR of it, or a DESCENDANT of it. All three
+are HARD PARSE ERRORS (not silent - the source exists, or could, but
+the relationship is illegal). Only SIBLING, COUSIN, and UNRELATED
+sources are allowed.
+
+The test is segment-wise (structural), not textual: reject when the
+source segment list is a prefix of the current list, or the current is
+a prefix of the source, or the two are equal; allow only when the
+paths DIVERGE at some segment.
+
+        =a b c
+          # equal       -> WARNING when DEBUG, nothing happens
+          &&& a b c
+          # ancestor    -> ERROR
+          &&& a b
+          # ancestor    -> ERROR
+          &&& a
+          # descendant  -> OK
+          &&& a b c d
+          # sibling     -> OK
+          &&& a b d
+          # cousin      -> OK
+          &&& a x
+          # unrelated   -> OK
+          &&& q
+
+Segment-wise means a shared STRING prefix does not count as a relation:
+
+        =app server
+          # 'app' IS a path-ancestor segment  -> ERROR
+          &&& app
+          # different segment, not an ancestor -> OK
+          &&& app-extras
+
+TEMPLATES ARE USUALLY ABSTRACT BUT NOT MANDATORY:
+A section meant only as a base for '&' is normally defined as an
+ABSTRACT section (12.) - its name led by '*' - so it is pruned from
+the output and leaves no trace. The copy mechanics above are identical
+whether the source is regular or abstract; only whether the SOURCE
+itself survives the final prune differs.
+
+& VERSUS @include:
+@include (8.) pulls a FILE into the tree from root and guards against
+cycles; '&' pulls a SECTION already in the tree, by value, at its
+stream position, and needs no cycle guard. Use @include to compose
+files; use '&' to share structure between sections within the
+accumulated tree.
+
+
+----------------------------------------------------------------
+12. ABSTRACT SECTIONS  '*'  (parse-time only, pruned from output)
+----------------------------------------------------------------
+
+An ABSTRACT section is one whose top-level name begins with '*'. It is
+ordinary in every parse-time respect - it merges, re-enters, takes
+keys, obeys clears, has auto-index children, and may inherit or be
+inherited from - but it is DISCARDED from the final tree at the end of
+the parse. Abstract sections hold templates and other build-time
+scaffolding that should not appear in the output.
+
+THE MARKER:
+A header line may begin with '*' instead of '='. The '*' is a line-
+leading marker, NOT a name character; the reader fuses it onto the
+FIRST path segment's name. So
+
+        *templates server          is exactly
+        =*templates server         with the '=' elided
+
+Both name the root section "*templates" and descend into "server". The
+'=' is simply dropped to avoid writing '=' and '*' together. The marker
+sits ONLY at the start of a header line and attaches ONLY to the root
+segment; you cannot type '*' anywhere inside a name, and there is no
+way to mark a deeper segment abstract on its own. Abstractness is
+therefore always a property of a WHOLE top-level branch.
+
+DISTINCT NAMES:
+'=server' and '*server' are DIFFERENT names and different sections.
+The leading '*' is part of the stored key, so the two never merge and
+are addressed separately:
+
+        =server                    regular section "server"
+        *server                    abstract section "*server"
+
+LEADING '*' vs AUTO-INDEX '*':
+The two uses never collide - one is strictly first-on-line, the other
+strictly not:
+  - a '*' as the FIRST char of a header line is the abstract marker
+  - a '*' as a later path SEGMENT is the auto-index allocator (5.)
+
+        *pool *                    abstract section "*pool", auto-index child
+        =pool *                    regular  section "pool",  auto-index child
+
+A bare '*' alone on a line is not a valid header (the marker needs a
+name after it); a lone '*' is only ever the auto-index segment.
+
+INHERITING ABSTRACT DATA:
+'&' (11.) reaches an abstract source by spelling the '*' in the source
+path; without it the source is regular:
+
+        & base                     inherit from regular  "base"
+        & *base                    inherit from abstract "*base"
+
+Because "*base" and "base" are different names, they are never on the
+same vertical path, so abstract<->regular inheritance is always lateral
+and always permitted (the branch restriction of 10. only bites within
+one same-named path). Every direction works: regular from abstract,
+abstract from regular, abstract from abstract, regular from regular.
+
+Grafted data SURVIVES the prune: '&' copies by value at parse time, so
+when the abstract source is dropped at the end, the copy already
+sitting in a regular section is untouched. This is the template-cleanup
+the inherit operator was missing - define a template abstract, inherit
+it, and it leaves no trace in the output.
+
+END-OF-PARSE PRUNE:
+After all files, includes, clears, and '&' snapshots are fully
+processed, the reader removes every top-level key beginning with '*'
+together with its entire subtree, then emits what remains. Nothing
+about the parse-time tree changes before that final step; '&' and every
+other operation see abstract sections in full while parsing.
+
+EXAMPLE:
+
+        # abstract template, pruned at end
+        *server base
+          workers 4
+          timeout 30
+        # nested via full path (headers absolute)
+        *server base tls
+          verify on
+
+        # real, emitted section
+        =server prod
+          # graft the template's keys + subtree
+          &&& *server base
+          # local override (after & => wins)
+          workers 16
+
+Emitted tree (the "*server" branch is gone):
+
+        {
+          "server": {
+            "prod": {
+              "workers": "16",
+              "timeout": "30",
+              "tls": { "verify": "on" }
+            }
+          }
+        }
+
+
+----------------------------------------------------------------
+13. PARSE ERRORS (summary)
+----------------------------------------------------------------
+
+  - unterminated quote on a value/list line
+  - illegal character in a name, segment or key (outside
+    [A-Za-z0-9:._/-])
+  - malformed clear line (a '!'-line with non-'!' content)
+  - malformed inherit line (a '&'-line with no source path, with '*'
+    in the source path, or with other non-path content)
+  - inherit source on the current vertical branch (equal / ancestor /
+    descendant of the current section)
+  - key name beginning with '-', '.', or '+' (reserved for key
+    operators)
+  - abstract header marker '*' with no name following it
+
+All errors report a line number and reject the file.
+
+
+----------------------------------------------------------------
+14. FULL EXAMPLE
+----------------------------------------------------------------
+
+        # relay base config
+        name relay-core
+        version 2.4.0
+        workers 8
+
+        # presence flag -> value "1"
+        debug
+
+        =database
+            host 127.0.0.1
+            port 5432
+            name payments
+
+        =server http
+            port 80
+
+        =server https
+            port 443
+            # value is a path (allowed in VALUES)
+            cert /etc/ssl/relay.pem
+
+        # back to root for the next root-level key
+        =
+            # scalar list (key line, attaches to current level = root)
+            allow_nets[] 10.0.0.0/8, 192.168.0.0/16
+            # ordered list of upstreams via auto-index
+
+        =upstream *
+            host    10.0.0.1
+            weight  100
+
+        =upstream *
+            host    10.0.0.2
+            weight  50
+
+        =terminal 00012345
+            pan_prefix 4571
+            currency 978
+
+Parsed shape (all values strings):
+
+        name="relay-core" version="2.4.0" workers="8" debug="1"
+        database = {host:"127.0.0.1", port:"5432", name:"payments"}
+        server   = {http:{port:"80"},
+                    https:{port:"443", cert:"/etc/ssl/relay.pem"}}
+        upstream = {"0":{host:"10.0.0.1",weight:"100"},
+                    "1":{host:"10.0.0.2",weight:"50"}}
+        allow_nets = ["10.0.0.0/8","192.168.0.0/16"]
+        terminal = {"00012345":{pan_prefix:"4571", currency:"978"}}
+
+Override layer (e.g. @include relay.local.nini) example:
+
+        # forget base upstreams (drop elements)
+        =upstream !!
+
+        # add new element, with automatic index/name, this one will be "0"
+        =upstream *
+            host 10.9.9.9
+            weight 200
+
+        # back to ROOT explicitly before a root key
+        =
+            # scalar replace at root (silent last-wins)
+            workers 16
+
+IMPORTANT - indentation is COSMETIC: NINI ignores leading whitespace
+on key lines. A key attaches to the most recent section HEADER, not
+to its visual indent level. In the override above, "workers 16"
+would attach to the last "=upstream *" element if we did NOT first
+issue a bare "=" to return to root. Always change level with a
+header ('=' / '=name ...'), never by out-denting.
+
+
